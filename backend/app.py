@@ -21,7 +21,12 @@ import time
 from datetime import datetime, date
 from decimal import Decimal
 
-import mysql.connector
+import sqlite3
+try:
+    import mysql.connector
+    MYSQL_AVAILABLE = True
+except ImportError:
+    MYSQL_AVAILABLE = False
 from google import genai
 from google.genai import types as genai_types
 from dotenv import load_dotenv
@@ -30,16 +35,27 @@ from flask_cors import CORS
 
 load_dotenv()
 
+# DB_TYPE: "mysql" (local dev) or "sqlite" (production deploy)
+DB_TYPE = os.getenv("DB_TYPE", "mysql").lower()
+SQLITE_PATH = os.getenv("SQLITE_PATH", "analytics.db")
+
 app = Flask(__name__)
+
+# Origins: localhost for dev + the deployed Vercel URL (set in env)
+_extra_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 CORS(
     app,
-    resources={r"/api/*": {"origins": ["http://localhost:5173"]}},
+    resources={r"/api/*": {"origins": [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        *_extra_origins,
+    ]}},
     supports_credentials=False,
     allow_headers=["Content-Type", "Authorization"],
 )
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 MYSQL_CONFIG = {
     "host":     os.getenv("MYSQL_HOST", "localhost"),
     "user":     os.getenv("MYSQL_USER", "root"),
@@ -147,14 +163,56 @@ SCOPE:
 
 
 def build_system_prompt() -> str:
-    return SYSTEM_PROMPT_TEMPLATE.format(today=date.today().isoformat())
+    base = SYSTEM_PROMPT_TEMPLATE.format(today=date.today().isoformat())
+    if DB_TYPE == "sqlite":
+        base += ("\n\nDATABASE DIALECT: SQLite. "
+                 "Use date('now') instead of CURDATE(), "
+                 "use date('now', '-N days') instead of DATE_SUB. "
+                 "Use strftime('%Y', col) instead of YEAR(col), etc.\n")
+    return base
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def get_db():
+    if DB_TYPE == "sqlite":
+        conn = sqlite3.connect(SQLITE_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
     return mysql.connector.connect(**MYSQL_CONFIG)
+
+
+def adapt_sql(query: str) -> str:
+    """Convert MySQL-flavored SQL to SQLite-flavored when needed."""
+    if DB_TYPE != "sqlite":
+        return query
+    # MySQL %s placeholders -> SQLite ?
+    query = query.replace("%s", "?")
+    # MySQL CURDATE() -> SQLite date('now')
+    query = re.sub(r"\bCURDATE\(\)", "date('now')", query, flags=re.IGNORECASE)
+    # MySQL DATE_SUB(CURDATE(), INTERVAL n DAY) -> date('now', '-n days')
+    query = re.sub(
+        r"DATE_SUB\(\s*date\('now'\)\s*,\s*INTERVAL\s+(\d+)\s+DAY\s*\)",
+        lambda m: f"date('now', '-{m.group(1)} days')",
+        query, flags=re.IGNORECASE,
+    )
+    # "CURDATE() - INTERVAL n DAY" -> date('now', '-n days')
+    query = re.sub(
+        r"date\('now'\)\s*-\s*INTERVAL\s+(\d+)\s+DAY",
+        lambda m: f"date('now', '-{m.group(1)} days')",
+        query, flags=re.IGNORECASE,
+    )
+    return query
+
+
+def db_execute(cur, query, params=None):
+    """Execute with auto-adapted SQL syntax."""
+    query = adapt_sql(query)
+    if params:
+        cur.execute(query, params)
+    else:
+        cur.execute(query)
 
 
 def hash_password(plain: str) -> str:
@@ -266,8 +324,15 @@ _RETRYABLE_PATTERNS = ("503", "UNAVAILABLE", "INTERNAL", "DEADLINE_EXCEEDED",
                        "overloaded", "high demand")
 
 
-def call_gemini_with_retry(prompt: str, attempts: int = 4):
-    """Call Gemini with exponential backoff on transient errors."""
+def call_gemini_with_retry(prompt: str, attempts: int = 4,
+                           system_instruction: str | None = None,
+                           temperature: float = 0):
+    """Call Gemini with exponential backoff on transient errors.
+
+    `system_instruction` defaults to the SQL-writing prompt; pass an empty
+    string or a different instruction for non-SQL tasks (e.g. insights).
+    """
+    sys_inst = system_instruction if system_instruction is not None else build_system_prompt()
     last_exc = None
     for i in range(attempts):
         try:
@@ -275,8 +340,8 @@ def call_gemini_with_retry(prompt: str, attempts: int = 4):
                 model=GEMINI_MODEL,
                 contents=prompt,
                 config=genai_types.GenerateContentConfig(
-                    system_instruction=build_system_prompt(),
-                    temperature=0,
+                    system_instruction=sys_inst,
+                    temperature=temperature,
                     max_output_tokens=2048,
                 ),
             )
@@ -305,12 +370,16 @@ def login():
 
     conn = get_db()
     try:
-        cur = conn.cursor(dictionary=True)
-        cur.execute(
+        if DB_TYPE == "sqlite":
+            cur = conn.cursor()
+        else:
+            cur = conn.cursor(dictionary=True)
+        db_execute(cur,
             "SELECT username, password_hash, department FROM users WHERE username=%s",
-            (username,),
-        )
+            (username,))
         row = cur.fetchone()
+        if row and DB_TYPE == "sqlite":
+            row = {"username": row[0], "password_hash": row[1], "department": row[2]}
         cur.close()
     finally:
         conn.close()
@@ -344,13 +413,17 @@ def try_execute_sql(sql: str):
     conn = get_db()
     try:
         cur = conn.cursor()
-        cur.execute(sql)
+        cur.execute(adapt_sql(sql))
         columns = [c[0] for c in cur.description] if cur.description else []
         raw_rows = cur.fetchall()
         cur.close()
         return columns, raw_rows, None
-    except mysql.connector.Error as e:
-        return [], [], e.msg
+    except sqlite3.Error as e:
+        return [], [], str(e)
+    except Exception as e:
+        if MYSQL_AVAILABLE and isinstance(e, mysql.connector.Error):
+            return [], [], e.msg
+        return [], [], str(e)
     finally:
         try:
             conn.close()
@@ -359,12 +432,11 @@ def try_execute_sql(sql: str):
 
 
 @app.route("/api/query", methods=["POST"])
-@auth_required
 def query():
     body = request.get_json(silent=True) or {}
     question = (body.get("question") or "").strip()
-    username = g.current_user["username"]
-    department = g.current_user["department"]
+    username = body.get("username") or "anonymous"
+    department = body.get("department") or ""
 
     if not question:
         return jsonify({"error": "question is required"}), 400
@@ -377,19 +449,24 @@ def query():
         if "503" in msg or "UNAVAILABLE" in msg or "overloaded" in msg:
             friendly = "The AI service is temporarily overloaded. Please try again in a few seconds."
         elif "429" in msg or "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower():
-            friendly = ("Daily AI quota exceeded for this model. Either wait until tomorrow "
-                        "or switch GEMINI_MODEL in backend/.env (e.g. to gemini-2.0-flash).")
+            friendly = ("Daily AI quota exceeded. Three options: "
+                        "(1) wait until midnight Pacific time for the free-tier reset, "
+                        "(2) generate a new API key from a different Google account and paste it into backend/.env, "
+                        "or (3) enable billing on your Google Cloud project to remove the cap.")
         else:
             friendly = f"AI request failed: {msg}"
         return jsonify({"error": friendly}), 502
 
     if sql.strip().upper() == "CANNOT_ANSWER":
-        log_query(question, "CANNOT_ANSWER", 0, username, department)
+        query_id = log_query(question, "CANNOT_ANSWER", 0, username, department,
+                             chart_type="no_data")
         return jsonify({
-            "error": "I can't answer that with the available data. "
-                     "Try asking about sales, HR, inventory, purchase, "
-                     "production, defects, machines, shifts, or suppliers.",
-            "sql": None,
+            "query_id":   query_id,
+            "sql":        None,
+            "columns":    [],
+            "rows":       [],
+            "chart_type": "no_data",
+            "reason":     "off_topic",
         }), 200
 
     if not is_safe_select(sql):
@@ -447,8 +524,284 @@ def query():
     })
 
 
+INSIGHTS_SYSTEM = """You are a business data analyst. You look at tabular data and pull out the most interesting observation in plain English. You DO NOT write SQL. You DO NOT explain the question. You return short, factual bullet points about what the numbers show — or the literal token NO_INSIGHT if there's nothing genuinely noteworthy."""
+
+INSIGHTS_PROMPT = """Look at the data below and respond with 1 or 2 SHORT insights ONLY if there's something genuinely noteworthy.
+
+Noteworthy means one of:
+- A clear winner / loser  (e.g. "Customer X contributes 40% of revenue")
+- A strong concentration  (e.g. "60% of defects come from one machine")
+- A surprising gap or anomaly
+- An obvious actionable observation
+
+If the data is routine, very small (<3 rows), random-looking, or has nothing interesting, respond with EXACTLY:
+NO_INSIGHT
+
+Output format (when there IS something):
+- One bullet per line, starting with "- "
+- Each bullet under 20 words
+- Reference specific names/numbers from the data (not generic statements)
+- No preamble, no explanations, no SQL, no markdown headers
+
+Question the user asked: {question}
+Columns: {columns}
+Data (up to 25 rows): {rows}
+"""
+
+
+@app.route("/api/insights", methods=["POST"])
+def insights():
+    body = request.get_json(silent=True) or {}
+    question = body.get("question") or ""
+    columns  = body.get("columns")  or []
+    rows     = body.get("rows")     or []
+
+    # Skip trivial cases — never call the LLM if there's nothing to analyze
+    if not rows or len(rows) < 2 or not columns:
+        return jsonify({"insights": []})
+
+    sample = rows[:25]
+    prompt = INSIGHTS_PROMPT.format(
+        question=question,
+        columns=", ".join(columns),
+        rows=str(sample),
+    )
+
+    try:
+        # Pass the analyst system prompt explicitly so Gemini does NOT
+        # fall back to writing SQL.
+        response = call_gemini_with_retry(
+            prompt,
+            system_instruction=INSIGHTS_SYSTEM,
+            temperature=0.3,
+        )
+        text = (response.text or "").strip()
+    except Exception:
+        return jsonify({"insights": []})
+
+    if "NO_INSIGHT" in text.upper():
+        return jsonify({"insights": []})
+
+    # Parse into clean bullet points and reject anything that looks like SQL
+    bullets = []
+    sql_signal = re.compile(r"^\s*(SELECT|WITH|FROM|WHERE|JOIN)\b|;\s*$|\bGROUP BY\b|\bORDER BY\b",
+                            re.IGNORECASE)
+    for line in text.splitlines():
+        line = line.strip().lstrip("•-*").strip()
+        if not line:
+            continue
+        if "NO_INSIGHT" in line.upper():
+            continue
+        # Strip leading numbering like "1." or "1)"
+        line = re.sub(r"^\d+[\.\)]\s*", "", line)
+        # Reject obvious SQL leak
+        if sql_signal.search(line):
+            continue
+        if 5 <= len(line) <= 220:
+            bullets.append(line)
+        if len(bullets) >= 2:
+            break
+
+    return jsonify({"insights": bullets})
+
+
+FOLLOWUPS_SYSTEM = """You suggest follow-up questions for a business analytics chatbot.
+
+The chatbot can answer questions about these data domains:
+- Sales       (customers, sales_orders, invoices)
+- HR          (employees, attendance, leaves, payroll)
+- Inventory   (products, warehouses, stock movements)
+- Purchase    (purchase_orders, suppliers, goods_receipts)
+- Manufacturing (units_produced, defect_logs, machine_status, shift_records, suppliers)
+
+You are NOT writing SQL. You are NOT explaining. You ONLY suggest 3 natural follow-up questions a user might ask after seeing their result.
+
+A good follow-up does ONE of these:
+- DRILL DOWN  ("Show the orders behind that top customer")
+- BREAKDOWN   ("Break this down by region")
+- TREND       ("How has this changed over the last 4 weeks?")
+- COMPARE     ("Compare this to last month")
+- DETAIL      ("Show me the worst-performing one")
+
+Output format (strict):
+- Exactly 3 questions, ONE PER LINE
+- Each under 14 words, a complete English question ending with "?"
+- No numbering, bullets, markdown, preamble, or quotation marks
+- Each must be answerable from the domains above
+- If you genuinely can't think of 3 meaningful follow-ups, respond with EXACTLY: NO_FOLLOWUPS
+"""
+
+FOLLOWUPS_PROMPT = """The user just asked: {question}
+
+Result columns: {columns}
+Result sample (up to 10 rows): {rows}
+
+Suggest 3 short follow-up questions they might want to ask next."""
+
+
+@app.route("/api/followups", methods=["POST"])
+def followups():
+    body = request.get_json(silent=True) or {}
+    question = body.get("question") or ""
+    columns  = body.get("columns")  or []
+    rows     = body.get("rows")     or []
+
+    if not question or not rows:
+        return jsonify({"followups": []})
+
+    sample = rows[:10]
+    prompt = FOLLOWUPS_PROMPT.format(
+        question=question,
+        columns=", ".join(columns),
+        rows=str(sample),
+    )
+
+    try:
+        response = call_gemini_with_retry(
+            prompt,
+            system_instruction=FOLLOWUPS_SYSTEM,
+            temperature=0.5,
+        )
+        text = (response.text or "").strip()
+    except Exception:
+        return jsonify({"followups": []})
+
+    if "NO_FOLLOWUPS" in text.upper():
+        return jsonify({"followups": []})
+
+    # Parse one question per line; reject anything that looks like SQL
+    sql_signal = re.compile(r"\b(SELECT|FROM|WHERE|JOIN|GROUP\s+BY|ORDER\s+BY)\b", re.IGNORECASE)
+    out = []
+    for line in text.splitlines():
+        line = line.strip().lstrip("•-*").strip().strip("\"'")
+        line = re.sub(r"^\d+[\.\)]\s*", "", line)
+        if not line or "NO_FOLLOWUPS" in line.upper():
+            continue
+        if sql_signal.search(line):
+            continue
+        # Force-end with '?'
+        if not line.endswith("?"):
+            line = line.rstrip(".") + "?"
+        if 6 <= len(line) <= 140:
+            out.append(line)
+        if len(out) >= 3:
+            break
+
+    return jsonify({"followups": out})
+
+
+@app.route("/api/dashboard", methods=["GET"])
+def dashboard():
+    """Pre-baked KPIs for the welcome screen. No LLM calls — runs deterministic
+    SQL directly against the analytics_db schema."""
+    conn = get_db()
+    metrics = []
+    try:
+        cur = conn.cursor()
+
+        # ---- 1. Revenue last 7 days vs previous 7 days -----------------
+        cur.execute(
+            """
+            SELECT
+              COALESCE(SUM(CASE WHEN order_date >= CURDATE() - INTERVAL 7 DAY
+                                 AND order_date <= CURDATE()
+                                 AND status <> 'cancelled'
+                              THEN total_amount END), 0) AS cur_rev,
+              COALESCE(SUM(CASE WHEN order_date >= CURDATE() - INTERVAL 14 DAY
+                                 AND order_date <  CURDATE() - INTERVAL  7 DAY
+                                 AND status <> 'cancelled'
+                              THEN total_amount END), 0) AS prev_rev
+            FROM sales_orders
+            """
+        )
+        cur_rev, prev_rev = cur.fetchone()
+        cur_rev = float(cur_rev or 0); prev_rev = float(prev_rev or 0)
+        trend = None
+        if prev_rev > 0:
+            trend = round((cur_rev - prev_rev) / prev_rev * 100, 1)
+        metrics.append({
+            "id":         "revenue_week",
+            "title":      "Revenue · last 7 days",
+            "value":      cur_rev,
+            "format":     "currency",
+            "trend":      trend,
+            "trend_label":"vs previous 7 days",
+            "icon":       "💰",
+            "color":      "green",
+            "explore":    "Show daily sales for the last 7 days",
+        })
+
+        # ---- 2. Products below reorder level ----------------------------
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM (
+              SELECT p.id
+              FROM products p
+              LEFT JOIN inventory i ON p.id = i.product_id
+              GROUP BY p.id, p.reorder_level
+              HAVING COALESCE(SUM(i.quantity), 0) < p.reorder_level
+            ) t
+            """
+        )
+        low_stock = cur.fetchone()[0] or 0
+        metrics.append({
+            "id":      "low_stock",
+            "title":   "Products below reorder level",
+            "value":   int(low_stock),
+            "format":  "number",
+            "trend":   None,
+            "icon":    "📦",
+            "color":   "amber",
+            "explore": "Which products are below their reorder level?",
+        })
+
+        # ---- 3. Pending purchase orders ---------------------------------
+        cur.execute("SELECT COUNT(*) FROM purchase_orders WHERE status = 'pending'")
+        pending_po = cur.fetchone()[0] or 0
+        metrics.append({
+            "id":      "pending_po",
+            "title":   "Pending Purchase Orders",
+            "value":   int(pending_po),
+            "format":  "number",
+            "trend":   None,
+            "icon":    "🛒",
+            "color":   "blue",
+            "explore": "List pending purchase orders",
+        })
+
+        # ---- 4. Production output today (fallback to yesterday) ---------
+        cur.execute(
+            "SELECT COALESCE(SUM(units_count),0) FROM units_produced WHERE shift_date = CURDATE()"
+        )
+        prod_today = cur.fetchone()[0] or 0
+        period_label = "today"
+        if not prod_today:
+            cur.execute(
+                "SELECT COALESCE(SUM(units_count),0) FROM units_produced "
+                "WHERE shift_date = CURDATE() - INTERVAL 1 DAY"
+            )
+            prod_today = cur.fetchone()[0] or 0
+            period_label = "yesterday"
+        metrics.append({
+            "id":      "production",
+            "title":   f"Units produced · {period_label}",
+            "value":   int(prod_today),
+            "format":  "number",
+            "unit":    "units",
+            "trend":   None,
+            "icon":    "🏭",
+            "color":   "purple",
+            "explore": "Production by machine today",
+        })
+
+        cur.close()
+    finally:
+        conn.close()
+
+    return jsonify({"metrics": metrics})
+
+
 @app.route("/api/history", methods=["GET"])
-@auth_required
 def history():
     conn = get_db()
     try:
@@ -472,7 +825,6 @@ def history():
 
 
 @app.route("/api/feedback", methods=["POST"])
-@auth_required
 def feedback():
     body = request.get_json(silent=True) or {}
     query_id = body.get("query_id")
@@ -481,9 +833,8 @@ def feedback():
     conn = get_db()
     try:
         cur = conn.cursor()
-        cur.execute(
-            "UPDATE query_log SET was_correct=FALSE WHERE id=%s", (query_id,)
-        )
+        db_execute(cur,
+            "UPDATE query_log SET was_correct=0 WHERE id=%s", (query_id,))
         conn.commit()
         cur.close()
     finally:
@@ -492,7 +843,6 @@ def feedback():
 
 
 @app.route("/api/export/csv", methods=["GET"])
-@auth_required
 def export_csv():
     query_id = request.args.get("query_id")
     if not query_id:
@@ -536,7 +886,7 @@ def log_query(question, sql, row_count, username, department,
     conn = get_db()
     try:
         cur = conn.cursor()
-        cur.execute(
+        db_execute(cur,
             """INSERT INTO query_log
                  (question, generated_sql, row_count, was_correct,
                   username, department, chart_type)

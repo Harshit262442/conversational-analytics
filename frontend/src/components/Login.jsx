@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { login } from '../api/client';
+import DataNetwork from './DataNetwork.jsx';
 
 export default function Login({ onLogin }) {
   const [username, setUsername] = useState('');
@@ -9,8 +10,7 @@ export default function Login({ onLogin }) {
 
   async function handleSubmit(e) {
     e.preventDefault();
-    setBusy(true);
-    setErr('');
+    setBusy(true); setErr('');
     try {
       const user = await login(username, password);
       onLogin(user);
@@ -23,16 +23,17 @@ export default function Login({ onLogin }) {
 
   return (
     <div className="login-wrap">
+      <DataNetwork density="low" tint="cool" />
       <form className="login-card" onSubmit={handleSubmit}>
-        <h1>Analytics Login</h1>
-        <p className="sub">Sign in to ask questions about production data.</p>
+        <h1>Analytics AI</h1>
+        <p className="sub">Sign in to ask anything about your data.</p>
         {err && <div className="err">{err}</div>}
         <label>Username</label>
         <input value={username} onChange={(e) => setUsername(e.target.value)} autoFocus />
         <label>Password</label>
         <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
         <button disabled={busy || !username || !password}>
-          {busy ? 'Signing in...' : 'Sign in'}
+          {busy ? 'Signing in...' : 'Sign in →'}
         </button>
         <div className="hint">
           Try <b>admin / admin123</b>, <b>alice / alice123</b>,

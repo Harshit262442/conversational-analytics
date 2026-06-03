@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { sendFeedback } from '../api/client';
 
-export default function FeedbackButton({ queryId }) {
+export default function FeedbackButton({ queryId, onFlag }) {
   const [sent, setSent] = useState(false);
   if (!queryId) return null;
 
@@ -10,9 +10,8 @@ export default function FeedbackButton({ queryId }) {
     try {
       await sendFeedback(queryId);
       setSent(true);
-    } catch {
-      /* swallow — feedback is best-effort */
-    }
+      if (onFlag) onFlag();
+    } catch {/* best effort */}
   }
   return (
     <button className="bad" onClick={flag} disabled={sent}>

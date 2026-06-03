@@ -1,47 +1,57 @@
 function iconFor(chartHint) {
-  if (chartHint === 'metric') return '🔢';
-  if (chartHint === 'line') return '📈';
-  if (chartHint === 'bar') return '📊';
+  if (chartHint === 'metric')  return '🔢';
+  if (chartHint === 'line')    return '📈';
+  if (chartHint === 'bar')     return '📊';
+  if (chartHint === 'no_data') return '📭';
   return '💬';
 }
 
-export default function HistoryPanel({ items, activeId, onPick, user }) {
+export default function HistoryPanel({ items, activeId, onPick, user, collapsed, onToggle }) {
   return (
-    <aside className="sidebar">
+    <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`}>
       <header>
         <div className="brand">
           <div className="brand-logo">✨</div>
-          <span className="brand-text">Analytics AI</span>
+          {!collapsed && <span className="brand-text">Analytics AI</span>}
         </div>
-        <div className="user-pill">
-          <span className="dot" />
-          {user?.username} · {user?.department}
-        </div>
-      </header>
-      <div className="history-section-title">Recent questions</div>
-      <div className="history-list">
-        {items.length === 0 && (
-          <div className="history-empty">
-            No questions yet. Ask one to get started.
+        {!collapsed && (
+          <div className="user-pill">
+            <span className="dot" />
+            {user?.username} · {user?.department}
           </div>
         )}
-        {items.map((h) => (
-          <div
-            key={h.id}
-            className={`history-item ${activeId === h.id ? 'active' : ''}`}
-            onClick={() => onPick(h)}
-          >
-            <span className="icon">{iconFor(h.chart_type)}</span>
-            <div style={{ minWidth: 0, flex: 1 }}>
-              <div className="q">{h.question}</div>
-              <div className="meta">
-                {h.row_count} rows · {h.username || 'anon'}
-                {!h.was_correct && ' · flagged'}
+        <button className="sidebar-toggle" onClick={onToggle} title={collapsed ? 'Expand' : 'Collapse'}>
+          {collapsed ? '▶' : '◀'}
+        </button>
+      </header>
+      {!collapsed && (
+        <>
+          <div className="history-section-title">Recent questions</div>
+          <div className="history-list">
+            {items.length === 0 && (
+              <div className="history-empty">
+                No questions yet. Ask one to get started.
               </div>
-            </div>
+            )}
+            {items.map((h) => (
+              <div
+                key={h.id}
+                className={`history-item ${activeId === h.id ? 'active' : ''}`}
+                onClick={() => onPick(h)}
+              >
+                <span className="icon">{iconFor(h.chart_type)}</span>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div className="q">{h.question}</div>
+                  <div className="meta">
+                    {h.row_count} rows · {h.username || 'anon'}
+                    {!h.was_correct && ' · flagged'}
+                  </div>
+                </div>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
+        </>
+      )}
     </aside>
   );
 }

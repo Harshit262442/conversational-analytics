@@ -2,6 +2,7 @@ import {
   BarChart, Bar, LineChart, Line,
   XAxis, YAxis, Tooltip, CartesianGrid, ResponsiveContainer, Legend,
 } from 'recharts';
+import AnimatedCounter from './AnimatedCounter.jsx';
 
 const COLORS = ['#8b5cf6', '#3b82f6', '#10b981', '#f59e0b', '#ec4899', '#06b6d4'];
 const GRID_STROKE  = 'rgba(255,255,255,0.08)';
@@ -32,7 +33,7 @@ export default function ChartRenderer({ columns, rows, chartType }) {
   if (chartType === 'metric') {
     return (
       <div className="metric-big">
-        <div className="num">{rows[0][0]}</div>
+        <div className="num"><AnimatedCounter value={rows[0][0]} /></div>
         <div className="lbl">{columns[0]}</div>
       </div>
     );
