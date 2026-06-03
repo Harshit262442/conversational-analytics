@@ -175,12 +175,46 @@ def build_system_prompt() -> str:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+_sqlite_initialized = False
+
 def get_db():
+    global _sqlite_initialized
     if DB_TYPE == "sqlite":
+        # Auto-initialize on first connection if DB is missing or has no users.
+        # This is a safety net — guarantees the DB is usable even if the
+        # `init_sqlite.py` step in the start command didn't run.
+        if not _sqlite_initialized:
+            _ensure_sqlite_ready()
+            _sqlite_initialized = True
         conn = sqlite3.connect(SQLITE_PATH)
         conn.row_factory = sqlite3.Row
         return conn
     return mysql.connector.connect(**MYSQL_CONFIG)
+
+
+def _ensure_sqlite_ready():
+    """If the SQLite DB is empty or missing, run init_sqlite.py to seed it."""
+    needs_seed = False
+    if not os.path.exists(SQLITE_PATH):
+        needs_seed = True
+    else:
+        try:
+            c = sqlite3.connect(SQLITE_PATH)
+            row = c.execute("SELECT COUNT(*) FROM users").fetchone()
+            c.close()
+            if not row or row[0] == 0:
+                needs_seed = True
+        except sqlite3.Error:
+            needs_seed = True
+
+    if needs_seed:
+        print(f"[boot] SQLite DB at {SQLITE_PATH} is empty/missing — seeding now...")
+        try:
+            import init_sqlite
+            init_sqlite.main()
+            print("[boot] SQLite seed complete.")
+        except Exception as e:
+            print(f"[boot] WARNING: failed to seed SQLite: {e}")
 
 
 def adapt_sql(query: str) -> str:
