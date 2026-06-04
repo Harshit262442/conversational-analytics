@@ -249,6 +249,18 @@ def db_execute(cur, query, params=None):
         cur.execute(query)
 
 
+def dict_cursor(conn):
+    """Return a cursor that yields dict-like rows on both MySQL and SQLite."""
+    if DB_TYPE == "sqlite":
+        return conn.cursor()                 # row_factory already set to sqlite3.Row
+    return conn.cursor(dictionary=True)      # mysql-connector keyword
+
+
+def rows_to_dicts(rows):
+    """Convert fetchall() output to a list of plain mutable dicts."""
+    return [dict(r) for r in rows]
+
+
 def hash_password(plain: str) -> str:
     return hashlib.sha256(plain.encode("utf-8")).hexdigest()
 
@@ -404,16 +416,13 @@ def login():
 
     conn = get_db()
     try:
-        if DB_TYPE == "sqlite":
-            cur = conn.cursor()
-        else:
-            cur = conn.cursor(dictionary=True)
+        cur = dict_cursor(conn)
         db_execute(cur,
             "SELECT username, password_hash, department FROM users WHERE username=%s",
             (username,))
         row = cur.fetchone()
-        if row and DB_TYPE == "sqlite":
-            row = {"username": row[0], "password_hash": row[1], "department": row[2]}
+        if row:
+            row = dict(row)
         cur.close()
     finally:
         conn.close()
@@ -839,7 +848,7 @@ def dashboard():
 def history():
     conn = get_db()
     try:
-        cur = conn.cursor(dictionary=True)
+        cur = dict_cursor(conn)
         cur.execute(
             """SELECT id, question, generated_sql, row_count, was_correct,
                       username, department, chart_type, created_at
@@ -847,7 +856,7 @@ def history():
                ORDER BY id DESC
                LIMIT 20"""
         )
-        rows = cur.fetchall()
+        rows = rows_to_dicts(cur.fetchall())
         cur.close()
     finally:
         conn.close()
@@ -883,13 +892,14 @@ def export_csv():
         return jsonify({"error": "query_id required"}), 400
     conn = get_db()
     try:
-        cur = conn.cursor(dictionary=True)
-        cur.execute("SELECT generated_sql FROM query_log WHERE id=%s", (query_id,))
+        cur = dict_cursor(conn)
+        db_execute(cur,
+            "SELECT generated_sql FROM query_log WHERE id=%s", (query_id,))
         log_row = cur.fetchone()
         cur.close()
         if not log_row:
             return jsonify({"error": "query_id not found"}), 404
-        sql = log_row["generated_sql"]
+        sql = dict(log_row)["generated_sql"]
         if not is_safe_select(sql):
             return jsonify({"error": "stored SQL is not a safe SELECT"}), 400
         cur = conn.cursor()
