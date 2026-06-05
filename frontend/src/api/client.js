@@ -5,8 +5,15 @@ const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '') + '/api
 
 const api = axios.create({
   baseURL: API_BASE,
-  timeout: 45000,
+  timeout: 90000,   // 90s — Render free tier can cold-start for 30-50s
 });
+
+// Fire-and-forget ping to wake the backend from Render's idle suspend.
+// Returns a promise so the caller can `await` if they want to gate the UI.
+export const wakeBackend = () =>
+  axios.get(`${API_BASE}/health`, { timeout: 90000 })
+       .then(r => r.data)
+       .catch(() => null);
 
 // Kept for backwards-compat — currently unused but Login still gets a token
 // in the response, we just don't enforce it.
