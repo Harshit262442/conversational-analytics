@@ -13,11 +13,14 @@ import csv
 import functools
 import hashlib
 import io
+import json
 import os
 import random
 import re
 import secrets
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, date
 from decimal import Decimal
 
@@ -54,8 +57,34 @@ CORS(
     allow_headers=["Content-Type", "Authorization"],
 )
 
+# ---- LLM provider config ----
+# "gemini" -> Google Gemini API (deployed/production default)
+# "ollama" -> local Ollama server (free, unlimited, runs on user's laptop)
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "sqlcoder:7b")
+OLLAMA_HOST  = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+# Speed tuning for CPU-only laptops:
+OLLAMA_KEEP_ALIVE   = os.getenv("OLLAMA_KEEP_ALIVE", "30m")        # keep model in RAM
+OLLAMA_NUM_PREDICT  = int(os.getenv("OLLAMA_NUM_PREDICT", "512"))  # cap output length
+OLLAMA_NUM_THREAD   = int(os.getenv("OLLAMA_NUM_THREAD", "0"))     # 0 = use all cores
+
+# Both features default ON for every provider. Failures degrade gracefully —
+# if the LLM returns something invalid, the parser drops it and the section
+# simply doesn't render. Set ENABLE_INSIGHTS=false or ENABLE_FOLLOWUPS=false
+# in .env to opt out (e.g. to save Gemini quota or speed up local Ollama).
+def _flag(name, default=True):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.lower() in ("1", "true", "yes", "on")
+
+ENABLE_INSIGHTS  = _flag("ENABLE_INSIGHTS",  True)
+ENABLE_FOLLOWUPS = _flag("ENABLE_FOLLOWUPS", True)
+
 MYSQL_CONFIG = {
     "host":     os.getenv("MYSQL_HOST", "localhost"),
     "user":     os.getenv("MYSQL_USER", "root"),
@@ -64,6 +93,9 @@ MYSQL_CONFIG = {
 }
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+print(f"[boot] LLM provider: {LLM_PROVIDER} "
+      f"({OLLAMA_MODEL if LLM_PROVIDER == 'ollama' else GEMINI_MODEL})")
 
 # In-memory session store: token -> {"username": ..., "department": ...}
 # Wiped on backend restart, which is fine for dev.
@@ -126,6 +158,15 @@ products(id, sku, product_name, category ['Raw Material','Tooling','Component','
 warehouses(id, warehouse_name, location, capacity)
 inventory(id, product_id->products.id, warehouse_id->warehouses.id, quantity, last_updated DATETIME)
 stock_movements(id, product_id->products.id, warehouse_id->warehouses.id, movement_type ['in','out','transfer','adjust'], quantity, reference, movement_date DATETIME)
+-- IMPORTANT: a product's stock is split across multiple warehouses. To compare
+-- stock against reorder_level (e.g. "products below reorder level"), SUM the
+-- quantity per product across all warehouses. ALWAYS put product_name AND
+-- reorder_level in BOTH the SELECT and the GROUP BY (MySQL requires this to use
+-- reorder_level in HAVING). Use exactly this pattern:
+--   SELECT p.product_name, p.reorder_level, SUM(i.quantity) AS total_qty
+--   FROM products p JOIN inventory i ON i.product_id = p.id
+--   GROUP BY p.product_name, p.reorder_level
+--   HAVING SUM(i.quantity) < p.reorder_level
 
 -- Sales
 customers(id, customer_name, email, phone, region ['North','South','East','West'], segment ['enterprise','mid_market','smb'], created_at)
@@ -335,12 +376,9 @@ def serialize(value):
 
 
 def ask_claude_for_sql(question: str, retry_context: dict | None = None) -> str:
-    """Ask Gemini for SQL. If retry_context is provided, send the failing
-    SQL + MySQL error back so the model can self-correct.
+    """Ask the configured LLM for SQL. If retry_context is provided, send the
+    failing SQL + MySQL error back so the model can self-correct.
     """
-    if gemini_client is None:
-        raise RuntimeError("GEMINI_API_KEY is not configured")
-
     if retry_context:
         prompt = (
             f"Question: {question}\n\n"
@@ -352,37 +390,44 @@ def ask_claude_for_sql(question: str, retry_context: dict | None = None) -> str:
     else:
         prompt = question
 
-    response = call_gemini_with_retry(prompt)
-    # If the model ran out of tokens mid-SQL, treat as failure so we don't
-    # send half a statement to MySQL.
-    try:
-        finish_reason = response.candidates[0].finish_reason
-        if finish_reason and str(finish_reason).upper().endswith("MAX_TOKENS"):
-            raise RuntimeError("Model response was truncated. Try a simpler question.")
-    except (AttributeError, IndexError):
-        pass
-    return clean_sql(response.text or "")
+    text = call_llm(prompt)
+    return clean_sql(text or "")
 
 
 # Errors worth retrying — server overload, transient unavailability, rate spikes.
 # We do NOT retry 400 (bad request), 401 (auth), or daily-quota exhaustion.
 _RETRYABLE_PATTERNS = ("503", "UNAVAILABLE", "INTERNAL", "DEADLINE_EXCEEDED",
-                       "overloaded", "high demand")
+                       "overloaded", "high demand", "timed out", "Connection reset")
 
 
-def call_gemini_with_retry(prompt: str, attempts: int = 4,
-                           system_instruction: str | None = None,
-                           temperature: float = 0):
-    """Call Gemini with exponential backoff on transient errors.
+def call_llm(prompt: str, attempts: int = 4,
+             system_instruction: str | None = None,
+             temperature: float = 0) -> str:
+    """Provider-agnostic LLM call. Returns the model's text response.
 
-    `system_instruction` defaults to the SQL-writing prompt; pass an empty
-    string or a different instruction for non-SQL tasks (e.g. insights).
+    Dispatches to Ollama (local) or Gemini (cloud) based on LLM_PROVIDER env var.
+    `system_instruction=None` uses the default SQL system prompt; pass any other
+    string for non-SQL tasks (e.g. insights, follow-ups).
     """
     sys_inst = system_instruction if system_instruction is not None else build_system_prompt()
+    if LLM_PROVIDER == "ollama":
+        return _call_ollama(prompt, sys_inst, temperature, attempts)
+    return _call_gemini(prompt, sys_inst, temperature, attempts)
+
+
+# Backwards-compat alias for any existing call sites
+call_gemini_with_retry = call_llm
+
+
+def _call_gemini(prompt: str, sys_inst: str, temperature: float, attempts: int) -> str:
+    """Call Google Gemini with exponential backoff on transient errors."""
+    if gemini_client is None:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+
     last_exc = None
     for i in range(attempts):
         try:
-            return gemini_client.models.generate_content(
+            response = gemini_client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=prompt,
                 config=genai_types.GenerateContentConfig(
@@ -391,15 +436,82 @@ def call_gemini_with_retry(prompt: str, attempts: int = 4,
                     max_output_tokens=2048,
                 ),
             )
+            # Reject truncated responses
+            try:
+                finish_reason = response.candidates[0].finish_reason
+                if finish_reason and str(finish_reason).upper().endswith("MAX_TOKENS"):
+                    raise RuntimeError("Model response was truncated. Try a simpler question.")
+            except (AttributeError, IndexError):
+                pass
+            return response.text or ""
         except Exception as e:
             msg = str(e)
             last_exc = e
             transient = any(p in msg for p in _RETRYABLE_PATTERNS)
             if not transient or i == attempts - 1:
                 raise
-            # Exponential backoff: 1s, 2s, 4s with a little jitter
-            delay = (2 ** i) + random.uniform(0, 0.5)
-            time.sleep(delay)
+            time.sleep((2 ** i) + random.uniform(0, 0.5))
+    raise last_exc  # pragma: no cover
+
+
+def _call_ollama(prompt: str, sys_inst: str, temperature: float, attempts: int) -> str:
+    """Call a local Ollama server (free, runs on user's laptop).
+
+    Note: local models (sqlcoder, qwen, llama) often under-weight the `system`
+    field. We inline the schema directly into the prompt with strong "use ONLY
+    these tables" framing, which dramatically reduces hallucinated table names.
+    """
+    merged_prompt = (
+        f"{sys_inst}\n\n"
+        f"=== END OF SCHEMA. The ONLY tables that exist are the ones listed above. ===\n"
+        f"=== Do NOT invent table or column names. Use plural forms exactly as listed. ===\n\n"
+        f"User question: {prompt}\n\n"
+        f"Write the SQL query now. Return ONLY the SQL, nothing else."
+    )
+    payload = {
+        "model":   OLLAMA_MODEL,
+        "prompt":  merged_prompt,
+        "stream":  False,
+        # keep_alive: keep the model loaded in RAM so the NEXT query doesn't
+        # pay the ~10s reload cost. "30m" keeps it warm for half an hour.
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+        "options": {
+            "temperature": temperature,
+            # SQL/insights are short — capping output keeps the model from
+            # rambling, which is the single biggest per-query time sink on CPU.
+            "num_predict": OLLAMA_NUM_PREDICT,
+            # num_thread=0 lets Ollama use all CPU cores (default, but explicit).
+            "num_thread": OLLAMA_NUM_THREAD,
+        },
+    }
+    body = json.dumps(payload).encode("utf-8")
+    url = f"{OLLAMA_HOST}/api/generate"
+
+    last_exc = None
+    for i in range(attempts):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return (data.get("response") or "").strip()
+        except urllib.error.URLError as e:
+            last_exc = e
+            # Connection refused or DNS error -> probably Ollama isn't running
+            if i == attempts - 1:
+                raise RuntimeError(
+                    f"Cannot reach Ollama at {OLLAMA_HOST}. "
+                    "Is the Ollama service running? Try `ollama serve` in a terminal."
+                ) from e
+            time.sleep((2 ** i) + random.uniform(0, 0.5))
+        except Exception as e:
+            last_exc = e
+            if i == attempts - 1:
+                raise
+            time.sleep((2 ** i) + random.uniform(0, 0.5))
     raise last_exc  # pragma: no cover
 
 
@@ -567,33 +679,32 @@ def query():
     })
 
 
-INSIGHTS_SYSTEM = """You are a business data analyst. You look at tabular data and pull out the most interesting observation in plain English. You DO NOT write SQL. You DO NOT explain the question. You return short, factual bullet points about what the numbers show — or the literal token NO_INSIGHT if there's nothing genuinely noteworthy."""
+INSIGHTS_SYSTEM = """You are a business data analyst. You write short observations about data in plain English. You always find something worth pointing out — the highest value, the lowest, the gap between them, or a clear pattern. You never write SQL or code. You talk to business managers in words, not code."""
 
-INSIGHTS_PROMPT = """Look at the data below and respond with 1 or 2 SHORT insights ONLY if there's something genuinely noteworthy.
+INSIGHTS_PROMPT = """Below is a result table. Write 1 or 2 short observations about it in plain English.
 
-Noteworthy means one of:
-- A clear winner / loser  (e.g. "Customer X contributes 40% of revenue")
-- A strong concentration  (e.g. "60% of defects come from one machine")
-- A surprising gap or anomaly
-- An obvious actionable observation
+Always find SOMETHING to say — for example:
+- Which item is highest and by how much (e.g. "Sales leads at 95,000, nearly double Production's 48,000.")
+- The overall spread or pattern (e.g. "Output rose steadily from Monday to Friday.")
+- Any item that stands out as unusually high or low.
 
-If the data is routine, very small (<3 rows), random-looking, or has nothing interesting, respond with EXACTLY:
-NO_INSIGHT
-
-Output format (when there IS something):
-- One bullet per line, starting with "- "
-- Each bullet under 20 words
-- Reference specific names/numbers from the data (not generic statements)
-- No preamble, no explanations, no SQL, no markdown headers
+Rules:
+- Start each observation with "- "
+- Keep each under 20 words and mention the actual names/numbers from the data
+- Plain English only. No SQL, no code, no backticks, no preamble.
 
 Question the user asked: {question}
 Columns: {columns}
-Data (up to 25 rows): {rows}
+Data: {rows}
+
+Write the observations now:
 """
 
 
 @app.route("/api/insights", methods=["POST"])
 def insights():
+    if not ENABLE_INSIGHTS:
+        return jsonify({"insights": []})
     body = request.get_json(silent=True) or {}
     question = body.get("question") or ""
     columns  = body.get("columns")  or []
@@ -611,36 +722,55 @@ def insights():
     )
 
     try:
-        # Pass the analyst system prompt explicitly so Gemini does NOT
+        # Pass the analyst system prompt explicitly so the LLM does NOT
         # fall back to writing SQL.
-        response = call_gemini_with_retry(
+        text = call_llm(
             prompt,
             system_instruction=INSIGHTS_SYSTEM,
             temperature=0.3,
-        )
-        text = (response.text or "").strip()
+        ).strip()
     except Exception:
         return jsonify({"insights": []})
 
     if "NO_INSIGHT" in text.upper():
         return jsonify({"insights": []})
 
-    # Parse into clean bullet points and reject anything that looks like SQL
+    # Parse into clean bullet points and reject anything that looks like SQL,
+    # code fences, or chatty preamble that small local models sometimes emit.
     bullets = []
-    sql_signal = re.compile(r"^\s*(SELECT|WITH|FROM|WHERE|JOIN)\b|;\s*$|\bGROUP BY\b|\bORDER BY\b",
+    sql_signal = re.compile(r"\b(SELECT|FROM|WHERE|JOIN|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|INSERT|UPDATE|DELETE)\b",
                             re.IGNORECASE)
+    preamble  = re.compile(r"^(here\s+(are|is)|key\s+(insights|takeaways)|insight\s*\d*|observation\s*\d*|analysis|summary)\b\s*:?\s*$",
+                            re.IGNORECASE)
+    # Strip out code fences entirely from the raw text before splitting
+    text = re.sub(r"```\w*", "", text)
+    text = text.replace("```", "")
+
     for line in text.splitlines():
-        line = line.strip().lstrip("•-*").strip()
+        line = line.strip().lstrip("•-*").strip().strip("\"'`")
         if not line:
             continue
         if "NO_INSIGHT" in line.upper():
             continue
-        # Strip leading numbering like "1." or "1)"
-        line = re.sub(r"^\d+[\.\)]\s*", "", line)
-        # Reject obvious SQL leak
+        if preamble.match(line):
+            continue
+        # Strip leading numbering like "1." or "1)" or "1:"
+        line = re.sub(r"^\d+[\.\)\:]\s*", "", line)
+        # Strip "Insight:" / "Observation:" prefixes
+        line = re.sub(r"^(insight|observation|takeaway|finding)s?\s*\d*\s*:\s*",
+                      "", line, flags=re.IGNORECASE)
+        # Drop lines with any backtick (code fence remnants)
+        if "`" in line:
+            continue
+        # Reject SQL keyword leaks
         if sql_signal.search(line):
             continue
-        if 5 <= len(line) <= 220:
+        # Must look like a real sentence — at least 3 words and a letter
+        if len(line.split()) < 3:
+            continue
+        if not re.search(r"[A-Za-z]{3,}", line):
+            continue
+        if 15 <= len(line) <= 220:
             bullets.append(line)
         if len(bullets) >= 2:
             break
@@ -648,42 +778,20 @@ def insights():
     return jsonify({"insights": bullets})
 
 
-FOLLOWUPS_SYSTEM = """You suggest follow-up questions for a business analytics chatbot.
+FOLLOWUPS_SYSTEM = """You suggest follow-up questions for a business analytics tool that has Sales, HR, Inventory, Purchase, and Manufacturing data. You always return exactly 3 short, natural questions a manager might ask next — things like drilling into a top item, breaking it down by category, comparing to last month, or looking at a trend over time. Each question is plain English, under 14 words, and ends with a question mark."""
 
-The chatbot can answer questions about these data domains:
-- Sales       (customers, sales_orders, invoices)
-- HR          (employees, attendance, leaves, payroll)
-- Inventory   (products, warehouses, stock movements)
-- Purchase    (purchase_orders, suppliers, goods_receipts)
-- Manufacturing (units_produced, defect_logs, machine_status, shift_records, suppliers)
+FOLLOWUPS_PROMPT = """The user just asked: "{question}"
+The result had these columns: {columns}
+Sample of the data: {rows}
 
-You are NOT writing SQL. You are NOT explaining. You ONLY suggest 3 natural follow-up questions a user might ask after seeing their result.
-
-A good follow-up does ONE of these:
-- DRILL DOWN  ("Show the orders behind that top customer")
-- BREAKDOWN   ("Break this down by region")
-- TREND       ("How has this changed over the last 4 weeks?")
-- COMPARE     ("Compare this to last month")
-- DETAIL      ("Show me the worst-performing one")
-
-Output format (strict):
-- Exactly 3 questions, ONE PER LINE
-- Each under 14 words, a complete English question ending with "?"
-- No numbering, bullets, markdown, preamble, or quotation marks
-- Each must be answerable from the domains above
-- If you genuinely can't think of 3 meaningful follow-ups, respond with EXACTLY: NO_FOLLOWUPS
+Write exactly 3 follow-up questions the user might ask next. One per line. Each a short plain-English question ending with "?". No SQL, no numbering, just the questions:
 """
-
-FOLLOWUPS_PROMPT = """The user just asked: {question}
-
-Result columns: {columns}
-Result sample (up to 10 rows): {rows}
-
-Suggest 3 short follow-up questions they might want to ask next."""
 
 
 @app.route("/api/followups", methods=["POST"])
 def followups():
+    if not ENABLE_FOLLOWUPS:
+        return jsonify({"followups": []})
     body = request.get_json(silent=True) or {}
     question = body.get("question") or ""
     columns  = body.get("columns")  or []
@@ -700,12 +808,11 @@ def followups():
     )
 
     try:
-        response = call_gemini_with_retry(
+        text = call_llm(
             prompt,
             system_instruction=FOLLOWUPS_SYSTEM,
             temperature=0.5,
-        )
-        text = (response.text or "").strip()
+        ).strip()
     except Exception:
         return jsonify({"followups": []})
 
@@ -947,7 +1054,14 @@ def log_query(question, sql, row_count, username, department,
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "time": datetime.utcnow().isoformat()})
+    return jsonify({
+        "status":    "ok",
+        "time":      datetime.utcnow().isoformat(),
+        "provider":  LLM_PROVIDER,
+        "model":     OLLAMA_MODEL if LLM_PROVIDER == "ollama" else GEMINI_MODEL,
+        "insights":  ENABLE_INSIGHTS,
+        "followups": ENABLE_FOLLOWUPS,
+    })
 
 
 if __name__ == "__main__":
