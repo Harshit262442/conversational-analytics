@@ -30,8 +30,17 @@ try:
     MYSQL_AVAILABLE = True
 except ImportError:
     MYSQL_AVAILABLE = False
-from google import genai
-from google.genai import types as genai_types
+# Google Gemini is an OPTIONAL cloud fallback. The project runs fully on a
+# local Ollama model by default, so this import is made optional — the app
+# works even if the google-genai package is not installed.
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    GENAI_AVAILABLE = True
+except ImportError:
+    genai = None
+    genai_types = None
+    GENAI_AVAILABLE = False
 from dotenv import load_dotenv
 from flask import Flask, g, jsonify, request, Response
 from flask_cors import CORS
@@ -58,14 +67,14 @@ CORS(
 )
 
 # ---- LLM provider config ----
-# "gemini" -> Google Gemini API (deployed/production default)
-# "ollama" -> local Ollama server (free, unlimited, runs on user's laptop)
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
+# "ollama" -> local Ollama server (DEFAULT — free, offline, runs on this machine)
+# "gemini" -> optional Google Gemini cloud fallback (needs GEMINI_API_KEY)
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "sqlcoder:7b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
 OLLAMA_HOST  = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 # Speed tuning for CPU-only laptops:
 OLLAMA_KEEP_ALIVE   = os.getenv("OLLAMA_KEEP_ALIVE", "30m")        # keep model in RAM
@@ -92,7 +101,8 @@ MYSQL_CONFIG = {
     "database": os.getenv("MYSQL_DB", "analytics_db"),
 }
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+gemini_client = (genai.Client(api_key=GEMINI_API_KEY)
+                 if (GENAI_AVAILABLE and GEMINI_API_KEY) else None)
 
 print(f"[boot] LLM provider: {LLM_PROVIDER} "
       f"({OLLAMA_MODEL if LLM_PROVIDER == 'ollama' else GEMINI_MODEL})")

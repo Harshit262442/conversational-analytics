@@ -1,92 +1,97 @@
 # Conversational Analytics Dashboard
 
-A Text-to-SQL analytics app for a manufacturing dataset.
-Ask questions in plain English; Claude generates the SQL; results show as
-charts and tables.
+Ask questions about a company database in **plain English** and get instant
+**charts and tables**. A local AI model (via Ollama) converts the question
+into SQL, the backend safely runs it on MySQL, and the result is visualised
+automatically. Covers five domains: **Sales, HR, Inventory, Purchase,
+Manufacturing**.
+
+**Everything runs locally and offline — no API keys, no usage limits, no data
+leaves the machine.**
 
 **Stack**
-- Frontend: React + Vite + Recharts + html2canvas
-- Backend: Python Flask + Anthropic SDK + mysql-connector-python
-- DB: MySQL
-- LLM: `claude-opus-4-7`
+- Frontend: React + Vite + Recharts
+- Backend: Python Flask
+- Database: MySQL 8
+- AI model: Ollama running `qwen2.5-coder` (local, on the CPU)
 
 ---
 
 ## 1. Prerequisites
 
-- Python 3.10+
-- Node 18+
-- MySQL 8 running locally
-- An Anthropic API key
+Install these four things first:
+
+| Tool | Download | Notes |
+|------|----------|-------|
+| **Python 3.10+** | https://www.python.org/downloads | Tick "Add Python to PATH" |
+| **Node.js 18+** | https://nodejs.org | |
+| **MySQL 8** | https://dev.mysql.com/downloads/installer | Remember the root password |
+| **Ollama** | https://ollama.com/download | Runs the AI model locally |
+
+After installing Ollama, download the model (one-time, ~4–5 GB):
+
+```bash
+ollama pull qwen2.5-coder:7b
+```
+
+> Optional: for a faster response on slower laptops, also `ollama pull qwen2.5-coder:3b`
+> and set `OLLAMA_MODEL=qwen2.5-coder:3b` in your `.env`.
 
 ---
 
 ## 2. Database setup
 
+Create and load the sample database (run from the project root):
+
 ```bash
 mysql -u root -p < seed.sql
+mysql -u root -p < seed_extended.sql
 ```
 
-That creates `analytics_db` with sample suppliers, machines, units, defects,
-shift records, a `users` table, and an empty `query_log` audit table.
+On Windows PowerShell, use:
 
-The seed file embeds placeholder user hashes for documentation only — run
-`backend/seed_users.py` after step 3 to install real sha256 hashes so
-login actually works:
-
-```bash
-cd backend
-python seed_users.py
+```powershell
+Get-Content seed.sql | mysql -u root -p
+Get-Content seed_extended.sql | mysql -u root -p
 ```
 
-Sample logins:
-
-| User  | Password   | Department  |
-|-------|------------|-------------|
-| admin | admin123   | Operations  |
-| alice | alice123   | Quality     |
-| bob   | bob123     | Production  |
-| carol | carol123   | Maintenance |
+This creates `analytics_db` with 22 tables of realistic sample data
+(dates are generated relative to today, so "this week" queries always work).
 
 ---
 
-## 3. Backend
+## 3. Backend (Flask)
 
 ```bash
 cd backend
 python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
+.venv\Scripts\activate        # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env            # then edit .env
+copy .env.example .env         # macOS/Linux: cp .env.example .env
+```
+
+Then open `.env` and set your **MySQL password** (the only value you must
+change). Everything else is pre-filled for local Ollama use.
+
+Seed the login users (one-time):
+
+```bash
+python seed_users.py
+```
+
+Start the backend:
+
+```bash
 python app.py
 ```
 
-Flask listens on `http://localhost:5000`.
-
-`.env` must contain:
-
-```
-ANTHROPIC_API_KEY=sk-ant-...
-MYSQL_HOST=localhost
-MYSQL_USER=root
-MYSQL_PASSWORD=your_password
-MYSQL_DB=analytics_db
-```
-
-### Endpoints
-
-| Method | Path                       | Purpose                              |
-|--------|----------------------------|--------------------------------------|
-| POST   | `/api/login`               | `{ username, password }` → user info |
-| POST   | `/api/query`               | `{ question, username, department }` |
-| GET    | `/api/history`             | Last 20 questions                    |
-| POST   | `/api/feedback`            | `{ query_id }` marks it wrong        |
-| GET    | `/api/export/csv?query_id` | CSV download                         |
-| GET    | `/api/health`              | Status ping                          |
+It serves on `http://localhost:5000`. Leave this window open.
 
 ---
 
-## 4. Frontend
+## 4. Frontend (React)
+
+In a **second** terminal:
 
 ```bash
 cd frontend
@@ -94,43 +99,73 @@ npm install
 npm run dev
 ```
 
-Vite serves on `http://localhost:5173`. Open it, sign in, and start asking
-questions.
+It serves on `http://localhost:5173`. Leave this window open too.
 
 ---
 
-## 5. Example questions to try
+## 5. Use it
 
-- *How many units did each machine produce this week?*
-- *Which defect type is most common?*
-- *Show daily production trend for the last week*
-- *Top 5 operators by total units produced*
-- *Which suppliers have the most defects?*
-- *How many machines are currently down?*
-- *Average hours worked per operator*
+1. Make sure **Ollama** is running (it starts automatically after install; look
+   for its icon in the system tray).
+2. Open **http://localhost:5173** in your browser.
+3. Sign in:
+
+   | Username | Password | Department  |
+   |----------|----------|-------------|
+   | admin    | admin123 | Operations  |
+   | alice    | alice123 | Quality     |
+   | bob      | bob123   | Production  |
+   | carol    | carol123 | Maintenance |
+
+4. Ask a question, e.g.:
+   - *Top 5 customers by total revenue*
+   - *Average salary by department*
+   - *Which products are below their reorder level?*
+   - *Daily production trend for the last 15 days*
+   - *How many invoices are overdue?*
+
+> The **first** question is slower (the AI model loads into memory). After that
+> it stays warm and responds in a few seconds. The chart and table appear first;
+> the AI insight and suggested follow-up questions stream in a moment later.
 
 ---
 
-## 6. Safety
+## 6. How it works (one paragraph)
 
-- Backend rejects any non-SELECT statement via a regex guard before
-  executing.
-- The system prompt instructs Claude to return only SELECT or the literal
-  `CANNOT_ANSWER`.
-- All queries are recorded in `query_log` with the issuing user and
-  department.
-- CORS is locked to `http://localhost:5173`.
+The browser sends your question to the Flask backend. The backend builds a
+prompt containing the full database schema and sends it to the local Ollama
+model, which returns a SQL query. The backend checks the SQL is a safe
+read-only `SELECT`, runs it on MySQL, auto-detects the best chart type, logs
+the query, and returns the rows. The frontend renders the chart, the table, an
+AI-written insight, and three suggested follow-up questions.
 
 ---
 
-## 7. Features summary
+## 7. Project layout
 
-- Login screen with sha256-hashed passwords (department attached to every
-  query for auditing).
-- Sidebar history (last 20 questions, click to re-run).
-- Auto-detected chart type: `metric` / `line` / `bar` / `table`.
-- Always shows the underlying SQL plus the raw data table.
-- Per-result CSV export, PNG export (via html2canvas), and "wrong answer"
-  feedback button.
-- Friendly error banner when the AI says `CANNOT_ANSWER` or returns
-  invalid SQL.
+```
+conversational-analytics/
+├── backend/
+│   ├── app.py              Flask app (API + AI + safety + SQL)
+│   ├── seed_users.py       Inserts login users
+│   ├── requirements.txt
+│   └── .env.example        Copy to .env
+├── frontend/
+│   └── src/                React components, API client, styles
+├── seed.sql                Manufacturing + system tables
+├── seed_extended.sql       HR, Inventory, Sales, Purchase tables
+├── Technical_Report.pdf    Full technical report
+└── README.md
+```
+
+---
+
+## 8. Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| "Cannot reach Ollama" | Make sure Ollama is running; try `ollama serve` in a terminal |
+| Login fails | Run `python seed_users.py` in the backend folder |
+| "Access denied" on MySQL | Check the password in `backend/.env` |
+| Recent-data queries return nothing | Re-run the two seed files to refresh dates |
+| First query very slow | Normal — the model is loading into RAM; subsequent queries are fast |
