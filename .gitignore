@@ -13,3 +13,9 @@ frontend/.vite/
 .DS_Store
 .idea/
 .vscode/
+
+# Local-only report working copies (only Project_Report.pdf is published)
+Technical_Report.docx
+Technical_Report.pdf
+Internship_Project_Report.docx
+gen_report.js
